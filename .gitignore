@@ -1,0 +1,4 @@
+_archive
+.ipynb_checkpoints
+MNIST
+*.pt
