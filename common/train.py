@@ -35,12 +35,15 @@ def train_model(net, optimizer, criterion, trainloader, num_ens=1, beta_type=0.1
     training_loss = 0.0
     accs = []
     kl_list = []
+    # CUDA settings
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
     for i, (inputs, labels) in enumerate(trainloader, 1):
 
         optimizer.zero_grad()
 
-        inputs, labels = inputs, labels
-        outputs = torch.zeros(inputs.shape[0], net.num_classes, num_ens)
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = torch.zeros(inputs.shape[0], net.num_classes, num_ens).to(device)
 
         kl = 0.0
         for j in range(num_ens):
@@ -67,10 +70,12 @@ def validate_model(net, criterion, validloader, num_ens=1, beta_type=0.1, epoch=
     net.train()
     valid_loss = 0.0
     accs = []
+    # CUDA settings
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     for i, (inputs, labels) in enumerate(validloader):
-        inputs, labels = inputs, labels
-        outputs = torch.zeros(inputs.shape[0], net.num_classes, num_ens)
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = torch.zeros(inputs.shape[0], net.num_classes, num_ens).to(device)
         kl = 0.0
         for j in range(num_ens):
             net_out, _kl = net(inputs)
