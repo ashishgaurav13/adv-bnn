@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.optim import Adam, lr_scheduler
 import re
 
+
 # Settings
 train = False
 HOME_DIR = "/home/fcbeylun/adv-bnn/"
@@ -264,14 +265,105 @@ def load_models(K = 50):
     print("Loaded %d sample models" % K)
     return sampled_models
 
+
 net = BBBLeNet(outputs, inputs, priors, layer_type, activation_type).to(device)
-
-
 sampled_models = load_models(K = 50)
-
 sampled_models = [m.to(device) for m in sampled_models]
-
 softplus = torch.nn.Softplus()
+
+
+def forward_pass(model, images, loss_target = None):
+    output = model(images)
+    output = torch.nn.LogSoftmax(dim=-1)(output)
+    which_class = torch.argmax(output).item()
+    if loss_target:
+        loss, target = loss_target
+        loss(output, target).backward()
+    return which_class
+
+
+def itcm(image, eps, model, steps, alpha, targets):
+    with torch.no_grad():
+        image_adv = torch.clone(image)
+    for n in range(steps):
+        image_adv.requires_grad = True
+        image_adv.grad = None
+        output   = model(image_adv)             #forward pass
+        output   = torch.nn.LogSoftmax(dim=-1)(output)
+        loss_fct = torch.nn.NLLLoss()
+        loss     = loss_fct(output, targets)       #compute loss
+        loss.backward()
+        with torch.no_grad():
+            x_grad         =  alpha * torch.sign(image_adv.grad)
+            adv_temp       = image_adv.data + x_grad  #add perturbation to img_variable which
+            #also contains perturbation from previous iterations
+            total_grad     = torch.clamp(adv_temp - image, -eps, eps)
+            image_adv.data = image - total_grad
+
+    return image_adv
+
+# How many models can an adversarial example fool?
+def how_many_can_it_fool(sampled_models, new_images):
+    fool = 0
+    for k in range(len(sampled_models)):
+        # Forward pass on sampled model k
+        old_class = forward_pass(sampled_models[k], images)
+
+        # Forward pass again on adv. example
+        new_class = forward_pass(sampled_models[k], new_images)
+
+        # If we change the class, we fool the model
+        fool += int(old_class != new_class)
+
+    return fool/len(sampled_models)
+
+
+def generate_adv_image(EPS,target,images):
+    # Collect noises (saliencies)
+    # EPS = 0.18
+    adv_images     = []
+    how_many_fooled = []
+    torch.set_printoptions(sci_mode=False)
+    # target = torch.tensor([1])
+    target = torch.tensor([target])
+    for k in range(len(sampled_models)):
+        # Forward pass
+        # Compute loss w.r.t. an incorrect class
+        # Note that we just have to ensure this class is different from targets
+        # print("\r Processing " + str(k+1) + "/%s" % len(sampled_models), end="")
+        images.grad = None
+        images.requires_grad = True
+        old_class = forward_pass(sampled_models[k], images, [torch.nn.NLLLoss(), target])
+        # Compute adversarial example
+        new_images = itcm(images, EPS, sampled_models[k], 15, EPS*0.25, target)
+        # Forward pass on adv. example
+        new_class = forward_pass(sampled_models[k], new_images)
+        if old_class != new_class:
+            # How many models can this adv. example fool?
+            how_many_fooled += [how_many_can_it_fool(sampled_models, new_images)]
+            #saliencies += [(new_images-images).sign().detach().view(28, 28)]
+            adv_images += [new_images.view(32, 32)]
+    # print("\nFinished")
+    return adv_images, how_many_fooled
+
+def combine_images(adv_images,success):
+    # distributional saliency map
+    combined_med  = torch.zeros_like(adv_images[0])
+    combined_mean = torch.zeros_like(adv_images[0])
+
+    adv_images = torch.stack(adv_images)
+    # print(saliencies.shape)
+    for i in range(combined_med.shape[0]):
+        for j in range(combined_med.shape[0]):
+            # choose median perturbation
+            combined_med[i, j] = np.percentile(adv_images[:, i, j].detach().numpy(), 50)
+            combined_mean[i, j] = adv_images[:, i, j].mean().item()
+    combined_med  = combined_med.reshape(-1,32,32)
+    combined_mean = combined_mean.reshape(-1,32,32)
+    champ         = adv_images[success.index(max(success))].reshape(-1,32,32)
+    return combined_med, combined_mean, champ
+
+
 
 
 # Train dataset
@@ -290,96 +382,11 @@ test_dataset = torchvision.datasets.MNIST(HOME_DIR, train=False, download=True,
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                           generator=torch.Generator().manual_seed(156))
 
-def forward_pass(model, images, loss_target = None):
-    model = model.to(device)
-    output = model(images)
-    output = torch.nn.LogSoftmax(dim=-1)(output)
-    which_class = torch.argmax(output).item()
-    if loss_target:
-        loss, target = loss_target
-        loss(output, target).backward()
-    return which_class
-
-def otcm(images, eps, saliency):
-    return torch.clamp(images.clone()-eps*saliency, 0, 1)
-
-
-# How many models can an adversarial example fool?
-def how_many_can_it_fool(sampled_models, eps, saliency):
-    fool = 0
-    for k in range(len(sampled_models)):
-        # Forward pass on sampled model k
-        old_class = forward_pass(sampled_models[k].to(device), images)
-        # One step Target Class Method (OTCM); saliency is noise
-        new_images = otcm(images, eps, saliency)
-        # Forward pass again on adv. example
-        new_class = forward_pass(sampled_models[k], new_images)
-        # If we change the class, we fool the model
-        fool += int(old_class != new_class)
-    return fool/len(sampled_models)
-
-
-def generate_saliency(EPS,target,images):
-    # Collect noises (saliencies)
-    # EPS = 0.18
-    saliencies = []
-    how_many_fooled = []
-    torch.set_printoptions(sci_mode=False)
-    # target = torch.tensor([1])
-    target = torch.tensor([target])
-    target     = target.to(device)
-    images = images.to(device)
-    for k in range(len(sampled_models)):
-        # Forward pass
-        # Compute loss w.r.t. an incorrect class
-        # Note that we just have to ensure this class is different from targets
-        # print("\r Processing " + str(k+1) + "/%s" % len(sampled_models), end="")
-        images.grad = None
-        images.requires_grad = True
-        old_class = forward_pass(sampled_models[k], images, [torch.nn.NLLLoss(), target])
-        # Compute adversarial example
-        new_images = otcm(images, EPS, images.grad.sign())
-        # Forward pass on adv. example
-        new_class = forward_pass(sampled_models[k], new_images)
-        if old_class != new_class:
-            # How many models can this adv. example fool?
-            how_many_fooled += [how_many_can_it_fool(sampled_models, EPS, images.grad.sign())]
-            saliencies += [images.to("cpu").grad.sign().view(32, 32)]
-    # print("\nFinished")
-    return saliencies, how_many_fooled
-
-
-
-
-def combine_saliencies(saliencies,success):
-
-    # print(saliencies.shape)
-    combined_med  = torch.zeros_like(saliencies[0])
-    combined_mean = torch.zeros_like(saliencies[0])
-    # distributional saliency map
-    saliencies = torch.stack(saliencies)
-    for i in range(combined_med.shape[0]):
-        for j in range(combined_med.shape[1]):
-            # choose median perturbation
-            combined_med[i, j] = np.percentile(saliencies[:, i, j].numpy(), 50)
-            combined_mean[i, j] = saliencies[:, i, j].mean().item()
-    combined_med  = combined_med
-    combined_mean = combined_mean
-    champ         = saliencies[success.index(max(success))]
-    return combined_med, combined_mean, champ
-
-
-if train:
-    loader = train_loader
-    prefix = "train"
-else:
-    loader = test_loader
-    prefix = "test"
 
 
 ## Generate
-EPS = 0.50
-SAVE_DIR = HOME_DIR + "mnist_adv_CNN/"
+EPS = 0.18
+SAVE_DIR = HOME_DIR + "mnist_adv_CNN_itcm_%s/" % EPS
 # for i in range(len(train_dataset.targets)):
 target_len = len(train_dataset.classes)
 targets    = set(range(10))
@@ -392,11 +399,22 @@ orgTarget   = []
 falseTarget = []
 
 
-
 images_med   = []
 images_mean  = []
 images_champ = []
 tru_labels   = []
+
+if not os.path.exists(SAVE_DIR):
+    os.mkdir(SAVE_DIR)
+
+
+if train:
+    loader = train_loader
+    prefix = "train"
+else:
+    loader = test_loader
+    prefix = "test"
+
 
 for data in loader:
     if counter < skip:
@@ -411,20 +429,19 @@ for data in loader:
     target     = int(np.random.choice(list(set(range(target_len)) - set([target_org])),size=1))
     image      = images
     # generating saliency maps using each sampled network
-    temp_sals, success = generate_saliency(EPS,target,image)
-    if len(temp_sals) == 0:
-        print("couldn't generate saliency")
+    temp_adv_images, success = generate_adv_image(EPS,target,image)
+    if len(temp_adv_images) == 0:
+        print("couldn't generate adveersarial image")
         continue
     successes.append(success)
     orgTarget.append(target_org)
     falseTarget.append(target)
     # combining maps into three types
-    combined_med, combined_mean, champ = combine_saliencies(temp_sals,success)
+    combined_med, combined_mean, champ = combine_images(temp_adv_images,success)
     # creating image
-    images_med.append(otcm(image, EPS, combined_med))
-    images_mean.append(otcm(image, EPS, combined_mean))
-    images_champ.append(otcm(image, EPS, champ))
-    print(len(images_med))
+    images_med.append(combined_med)
+    images_mean.append(combined_mean)
+    images_champ.append(champ)
     tru_labels.append(target_org)
 
     if counter % save_int == 0:
